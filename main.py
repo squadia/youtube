@@ -1,66 +1,44 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import yt_dlp
-import whisper
+from youtube_transcript_api import YouTubeTranscriptApi
 import openai
 import os
-import tempfile
-
-# Clé OpenAI (à remplacer ou à mettre dans les variables d'environnement Render)
-openai.api_key = os.getenv("OPENAI_API_KEY", "ta_cle_openai_ici")
 
 app = FastAPI()
 
-class VideoInput(BaseModel):
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+class VideoUrl(BaseModel):
     url: str
 
-@app.get("/")
-def home():
-    return {"message": "API YouTube opérationnelle"}
+def extract_video_id(url):
+    if "watch?v=" in url:
+        return url.split("watch?v=")[-1].split("&")[0]
+    elif "youtu.be/" in url:
+        return url.split("youtu.be/")[-1].split("?")[0]
+    else:
+        return None
 
 @app.post("/analyser")
-def analyser_video(input: VideoInput):
-    url = input.url
+async def analyser_video(data: VideoUrl):
+    video_id = extract_video_id(data.url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="URL invalide")
 
-    # Créer un dossier temporaire pour stocker le fichier audio
-    with tempfile.TemporaryDirectory() as tmpdir:
-        audio_path = os.path.join(tmpdir, "audio.mp3")
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        full_text = " ".join([entry["text"] for entry in transcript_list])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur transcript : {str(e)}")
 
-        # Télécharger l'audio avec yt-dlp
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': audio_path,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        # Transcrire avec Whisper
-        model = whisper.load_model("base")  # tu peux mettre "small", "medium", "large"
-        result = model.transcribe(audio_path)
-        transcription = result["text"]
-
-        # Résumer avec GPT
-        prompt = f"""Voici une transcription d'une vidéo YouTube :
-
-{transcription}
-
-Fais un résumé structuré et concis en 5 bullet points maximum. Mets en valeur les infos utiles pour quelqu'un qui n'a pas le temps de tout écouter."""
-        
+    try:
+        prompt = f"Résume cette vidéo en français de façon concise :\n{full_text}"
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
         )
-
-        summary = response["choices"][0]["message"]["content"]
-
-    return {
-        "url": url,
-        "résumé": summary
-    }
-
+        summary = response.choices[0].message.content.strip()
+        return {"résumé": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur GPT : {str(e)}")
